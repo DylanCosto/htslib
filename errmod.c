@@ -134,6 +134,22 @@ void errmod_destroy(errmod_t *em)
     free(em);
 }
 
+// Typical depths are small, where insertion sort is much faster than introsort
+// (which also allocates its stack on each call). The sorted result is the same.
+static inline int errmod_sort(int n, uint16_t *a)
+{
+    if (n > 64)
+        return ks_introsort(uint16_t, n, a);
+    int i, j;
+    for (i = 1; i < n; ++i) {
+        uint16_t x = a[i];
+        for (j = i; j > 0 && a[j-1] > x; --j)
+            a[j] = a[j-1];
+        a[j] = x;
+    }
+    return 0;
+}
+
 //
 // em: error model to fit to data
 // m: number of alleles across all samples
@@ -160,7 +176,7 @@ int errmod_cal(const errmod_t *em, int n, int m, uint16_t *bases, float *q)
         ks_shuffle(uint16_t, n, bases);
         n = 255;
     }
-    if (ks_introsort(uint16_t, n, bases) < 0)
+    if (errmod_sort(n, bases) < 0)
         return -1;
     /* zero out w and aux */
     memset(w, 0, 32 * sizeof(int));
