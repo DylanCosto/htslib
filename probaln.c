@@ -34,6 +34,7 @@
 #include <limits.h>
 #include <math.h>
 #include <errno.h>
+#include <pthread.h>
 #include "htslib/hts.h"
 #include "htslib/hts_alloc.h"
 
@@ -45,6 +46,64 @@
 #define EM .33333333333
 
 static float g_qual2prob[256];
+
+// The forward and backward matrices are reused between calls by each thread,
+// which avoids the cost of allocating and zeroing fresh memory for every read
+// (significant when many threads allocate in parallel). Only the cells which
+// can be read before being written are zeroed, see probaln_zero_guard().
+#define PROBALN_CACHE_MAX (16*1024*1024)
+typedef struct { void *buf; size_t size; } probaln_cache_t;
+static pthread_key_t probaln_key;
+static pthread_once_t probaln_once = PTHREAD_ONCE_INIT;
+static int probaln_key_ok = 0;
+
+static void probaln_cache_free(void *ptr)
+{
+    probaln_cache_t *cache = (probaln_cache_t*) ptr;
+    if ( !cache ) return;
+    free(cache->buf);
+    free(cache);
+}
+// Zero the cells of row i outside the band [u_beg, u_end+2]. The recursions
+// read these as zeros (they were zeroed by calloc in the original code).
+static inline void probaln_zero_guard(double *row, int u_beg, int u_end, size_t i_dim)
+{
+    int i, n = (int) i_dim;
+    if ( u_beg > n ) u_beg = n;
+    for (i = 0; i < u_beg; i++) row[i] = 0;
+    for (i = u_end + 3 > 0 ? u_end + 3 : 0; i < n; i++) row[i] = 0;
+}
+
+static void probaln_init(void)
+{
+    int i;
+    for (i = 0; i < 256; ++i)
+        g_qual2prob[i] = pow(10, -i/10.);
+    probaln_key_ok = pthread_key_create(&probaln_key, probaln_cache_free)==0 ? 1 : 0;
+}
+// Returns uninitialized memory of the given size, either from the cache
+// (*cached is set to 1) or newly allocated (*cached is set to 0, the caller frees)
+static void *probaln_malloc(size_t size, int *cached)
+{
+    *cached = 0;
+    if ( size > PROBALN_CACHE_MAX || !probaln_key_ok ) return malloc(size);
+    probaln_cache_t *cache = (probaln_cache_t*) pthread_getspecific(probaln_key);
+    if ( !cache )
+    {
+        cache = (probaln_cache_t*) calloc(1, sizeof(*cache));
+        if ( !cache || pthread_setspecific(probaln_key, cache)!=0 ) { free(cache); return malloc(size); }
+    }
+    if ( cache->size < size )
+    {
+        void *tmp = malloc(size);
+        if ( !tmp ) return NULL;
+        free(cache->buf);
+        cache->buf  = tmp;
+        cache->size = size;
+    }
+    *cached = 1;
+    return cache->buf;
+}
 
 #define set_u(u, b, i, k) { int x=(i)-(b); x=x>0?x:0; (u)=((k)-x+1)*3; }
 
@@ -81,7 +140,7 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
 {
     double *f = NULL, *b = NULL, *s = NULL, m[9], sI, sM, bI, bM;
     float *qual = NULL;
-    int bw, bw2, i, k, is_backward = 1, Pr;
+    int bw, bw2, i, k, is_backward = 1, Pr, cached = 0;
 
     if ( l_ref<0 || l_query<0 || l_query >= INT_MAX - 2) {
         errno = EINVAL;
@@ -106,12 +165,16 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
         errno = ENOMEM; // Allocation would fail
         return INT_MIN;
     }
-    f = calloc((l_query+1)*i_dim, sizeof(double));
-    if (!f) goto fail;
-    if (is_backward) {
-        b = calloc((l_query+1)*i_dim, sizeof(double));
-        if (!b) goto fail;
+    pthread_once(&probaln_once, probaln_init);
+    size_t fb_size = (l_query+1)*i_dim;
+    if (SIZE_MAX / sizeof(double) / 2 < fb_size) {
+        errno = ENOMEM;
+        return INT_MIN;
     }
+    f = (double*) probaln_malloc(fb_size*sizeof(double)*(is_backward ? 2 : 1), &cached);
+    if (!f) goto fail;
+    if (is_backward)
+        b = f + fb_size;
 
     // s[] is the scaling factor to avoid underflow
     s = hts_malloc_ps(sizeof(*s), l_query, 2);
@@ -120,9 +183,6 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
     // initialize qual
     qual = hts_malloc_p(sizeof(float), l_query);
     if (!qual) goto fail;
-    if (g_qual2prob[0] == 0)
-        for (i = 0; i < 256; ++i)
-            g_qual2prob[i] = pow(10, -i/10.);
     qual[0] = 0.0; // Should be unused
     for (i = 0; i < l_query; ++i)
         qual[i] = g_qual2prob[iqual? iqual[i] : 30];
@@ -150,6 +210,7 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
 
     /*** forward ***/
     // f[0]
+    memset(f, 0, sizeof(*f) * 2 * i_dim);   // rows 0 and 1
     set_u(k, bw, 0, 0);
     f[0*i_dim+k] = s[0] = 1.;
     { // f[1]
@@ -171,6 +232,12 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
         uint8_t qyi = query[i - 1];
         x = i - bw; beg = beg > x? beg : x; // band start
         x = i + bw; end = end < x? end : x; // band end
+        {
+            int u_beg, u_end;
+            set_u(u_beg, bw, i, beg);
+            set_u(u_end, bw, i, end);
+            probaln_zero_guard(fi, u_beg, u_end, i_dim);
+        }
 
         // NB end-beg is almost always 14 (99.9% of the time)
         // Hence not a large volume to parallelise.
@@ -225,9 +292,10 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
             // we just increment the pointers.
             double *xi = &fi[u];
             double *yi = &fi1[v11];
-            // Derived from xi[0,2] in previous loop iter.
-            double  l_x0 = m[2]*xi[0];
-            double  l_x2 = m[8]*xi[2];
+            // Derived from xi[0,2] in previous loop iter, the first
+            // cell has not been written yet and is taken as zero.
+            double  l_x0 = 0.0;
+            double  l_x2 = 0.0;
             for (k = beg, sum = 0.; k <= end; ++k, xi+=3, yi+=3) {
                 int cond = (ref[k-1] > 3 || qyi > 3)*2 + (ref[k-1] == qyi);
 
@@ -283,12 +351,15 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
         Pr1 += -4.343 * log(p * l_ref * l_query);
         Pr = (int)(Pr1 + .499);
         if (!is_backward) { // skip backward and MAP
-            free(f); free(s); free(qual);
+            if (!cached) free(f);
+            free(s); free(qual);
             return Pr;
         }
     }
     /*** backward ***/
     // b[l_query] (b[l_query+1][0]=1 and thus \tilde{b}[][]=1/s[l_query+1]; this is where s[l_query+1] comes from)
+    memset(&b[l_query*i_dim], 0, sizeof(*b) * i_dim);
+    memset(b, 0, sizeof(*b) * i_dim);   // row 0
     for (k = 1; k <= l_ref; ++k) {
         int u;
         double *bi = &b[l_query*i_dim];
@@ -303,6 +374,12 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
         uint8_t qyi1 = query[i];
         x = i - bw; beg = beg > x? beg : x;
         x = i + bw; end = end < x? end : x;
+        {
+            int u_beg, u_end;
+            set_u(u_beg, bw, i, beg);
+            set_u(u_end, bw, i, end);
+            probaln_zero_guard(bi, u_beg, u_end, i_dim);
+        }
         double E[] = {
             qli1 * EM, //000
             1. - qli1, //001
@@ -426,11 +503,13 @@ int probaln_glocal(const uint8_t *ref, int l_ref, const uint8_t *query,
     }
 
     /*** free ***/
-    free(f); free(b); free(s); free(qual);
+    if (!cached) free(f);
+    free(s); free(qual);
     return Pr;
 
  fail:
-    free(f); free(b); free(s); free(qual);
+    if (!cached) free(f);
+    free(s); free(qual);
     return INT_MIN;
 }
 

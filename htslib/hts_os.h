@@ -26,6 +26,7 @@ DEALINGS IN THE SOFTWARE.  */
 #ifndef HTSLIB_HTS_OS_H
 #define HTSLIB_HTS_OS_H
 
+#include <stdint.h>
 #include "hts_defs.h"
 
 #ifdef __cplusplus
@@ -48,6 +49,29 @@ double hts_drand48(void);
 
 HTSLIB_EXPORT
 long hts_lrand48(void);
+
+/// Make hts_drand48() calls from the current thread use a private state
+/** @param xseed  48-bit state in the hts_erand48() format, or NULL to revert
+                  to the shared global state
+    @param ndraw  if not NULL, incremented on each hts_drand48() call made by
+                  the current thread while the private state is in use
+
+    This allows multi-threaded programs to reproduce exactly the sequence of
+    numbers a single-threaded program would draw, e.g. by jumping ahead in the
+    sequence with hts_rand48_skip().
+*/
+HTSLIB_EXPORT
+void hts_drand48_set_thread_state(unsigned short *xseed, uint64_t *ndraw);
+
+/// Copy the current state of the global hts_drand48() generator
+/** @return 0 on success, -1 if not supported on this platform
+*/
+HTSLIB_EXPORT
+int hts_drand48_get_state(unsigned short xseed[3]);
+
+/// Advance a hts_erand48() state as if it had been used n times
+HTSLIB_EXPORT
+void hts_rand48_skip(unsigned short xseed[3], uint64_t n);
 
 #if defined(_WIN32) && !defined(__CYGWIN__)
 // Windows usually lacks *rand48(), but cygwin provides them.

@@ -87,7 +87,21 @@ double hts_erand48(unsigned short xseed[3])
 HTSLIB_EXPORT
 double hts_drand48(void)
 {
+	if ( hts_tls_xseed )
+	{
+		if ( hts_tls_ndraw ) (*hts_tls_ndraw)++;
+		return hts_erand48(hts_tls_xseed);
+	}
 	return hts_erand48(_rand48_seed);
+}
+
+HTSLIB_EXPORT
+int hts_drand48_get_state(unsigned short xseed[3])
+{
+	xseed[0] = _rand48_seed[0];
+	xseed[1] = _rand48_seed[1];
+	xseed[2] = _rand48_seed[2];
+	return 0;
 }
 
 HTSLIB_EXPORT
